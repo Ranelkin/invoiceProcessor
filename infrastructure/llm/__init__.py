@@ -1,1 +1,1 @@
-from llm_provider import model
+from .llm_provider import model

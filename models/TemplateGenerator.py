@@ -4,7 +4,7 @@ import re
 import datetime 
 import os 
 from typing import Optional, Dict
-from ..infrastructure.llm import model
+from infrastructure.llm import model
 
 class TemplateGenerator: 
     

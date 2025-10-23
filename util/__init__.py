@@ -1,0 +1,1 @@
+from .extractText import * 

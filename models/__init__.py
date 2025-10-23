@@ -1,2 +1,2 @@
-from randomForest import * 
-from TemplateGenerator import * 
+from .randomForest import * 
+from .TemplateGenerator import * 
