@@ -1,0 +1,3 @@
+{
+    "supported_models": ["anthropic", "openai", "xAI"]
+}
