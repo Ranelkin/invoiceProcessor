@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 from pathlib import Path
 from models import TemplateGenerator
-from util import extract_company_name
+
 class TemplateInvoiceExtractor:
     """
     Invoice extractor that uses YAML templates exclusively.

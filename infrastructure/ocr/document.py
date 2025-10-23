@@ -1,7 +1,7 @@
 import pytesseract
 from PIL import Image
 import io
-
+import re 
 def ocr_page(image_bytes: bytes) -> str:
     # Convert bytes back to image
     img = Image.open(io.BytesIO(image_bytes))
@@ -20,7 +20,7 @@ def ocr_document(processed_pages: list[bytes]) -> str:
     for i, page_bytes in enumerate(processed_pages, 1):
         print(f"Processing page {i}...")
         text = ocr_page(page_bytes)
-        full_text.append(text)
+        full_text.append(re.sub(r'\s+', ' ', text.strip()))
     return "\n\n--- PAGE BREAK ---\n\n".join(full_text)
 
 if __name__ == '__main__':

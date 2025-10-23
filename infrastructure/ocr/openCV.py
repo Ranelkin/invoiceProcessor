@@ -125,6 +125,8 @@ def remove_borders(image: np.ndarray, border_size: int = 10) -> np.ndarray:
 
 if __name__ == '__main__':
     import os 
+    from dotenv import load_dotenv
+    load_dotenv()
     input_path =  os.environ.get("TEST_PATH")
     output_path = './Test_Output.pdf'
     
