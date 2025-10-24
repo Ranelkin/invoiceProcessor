@@ -1,13 +1,7 @@
-#!/usr/bin/env python3
-"""
-Template-Based Invoice Extractor
-Uses YAML templates exclusively for invoice data extraction
-"""
-
 import re
 import yaml
 import os
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 from pathlib import Path
 from models import TemplateGenerator
@@ -15,7 +9,6 @@ from models import TemplateGenerator
 class TemplateInvoiceExtractor:
     """
     Invoice extractor that uses YAML templates exclusively.
-    No fallback patterns - if no template matches, extraction fails gracefully.
     """
     
     def __init__(self, template_dir: str = "./templates"):
@@ -50,27 +43,44 @@ class TemplateInvoiceExtractor:
         print(f"\nTotal templates loaded: {len(templates)}")
         return templates
     
-    def extract_invoice_data(self, text: str) -> Dict:
+    def extract_invoice_data(self, text: str, auto_generate: bool = False) -> Dict:
         """
         Extract invoice data using YAML templates only.
         
         Args:
             text: OCR'd invoice text
+            auto_generate: If True, automatically generate template when none matches
             
         Returns:
             Dictionary with extracted fields and metadata
         """
+        # First, try to identify the issuer from the document
+        identified_issuer = self._identify_issuer(text)
+        
+        print(f"\nIssuer identification: {identified_issuer or 'Unable to identify'}")
+        
         # Find matching template
-        matched_template = self._match_template(text)
+        matched_template = self._match_template(text, identified_issuer)
         
         if not matched_template:
-            return {
-                "error": "No matching template found",
-                "extraction_method": "none",
-                "template_used": None,
-                "confidence": 0.0,
-                "available_templates": list(self.templates.keys())
-            }
+            if auto_generate and identified_issuer:
+                print(f"\nGenerating new template for: {identified_issuer}")
+                generator = TemplateGenerator()
+                generator.generate_template(invoice_text=text, company_name=identified_issuer)
+                # Reload templates and try again
+                self.reload_templates()
+                matched_template = self._match_template(text, identified_issuer)
+            
+            if not matched_template:
+                return {
+                    "error": "No matching template found",
+                    "identified_issuer": identified_issuer,
+                    "extraction_method": "none",
+                    "template_used": None,
+                    "confidence": 0.0,
+                    "available_templates": list(self.templates.keys()),
+                    "suggestion": f"Create a template for '{identified_issuer}' or enable auto_generate=True"
+                }
         
         print(f"✓ Using template for: {matched_template['issuer']}")
         
@@ -78,42 +88,199 @@ class TemplateInvoiceExtractor:
         result = self._extract_with_template(text, matched_template)
         result["extraction_method"] = "template"
         result["template_used"] = matched_template['issuer']
+        result["identified_issuer"] = identified_issuer
         
         # Calculate confidence
         result["confidence"] = self._calculate_confidence(result)
         
         return result
     
-    def _match_template(self, text: str) -> Optional[Dict]:
+    def _identify_issuer(self, text: str) -> Optional[str]:
         """
-        Match text against template keywords to find the right template.
+        Attempt to identify the invoice issuer from the document.
+        Looks in typical locations: header, "From:", "Issuer:", etc.
         
         Args:
             text: Invoice text
             
         Returns:
+            Identified issuer name or None
+        """
+        lines = text.split('\n')
+        text_lower = text.lower()
+        
+        # Strategy 1: Look for company name in first few lines (most common)
+        # Many invoices start with company name/header
+        header_lines = lines[:5]  # Check first 5 lines
+        for line in header_lines:
+            line_clean = line.strip()
+            # Look for lines with company indicators
+            company_indicators = [
+                'gmbh', 'ag', 'inc', 'ltd', 'llc', 'corp', 'corporation',
+                'aps', 'a/s', 'services', 'e.k', 'kg', 'ohg', 'co.'
+            ]
+            
+            if any(indicator in line_clean.lower() for indicator in company_indicators):
+                # Clean the line
+                issuer = re.sub(r'[«»]', '', line_clean)  # Remove special chars
+                issuer = re.sub(r'\s+', ' ', issuer).strip()
+                
+                # Validate: should be reasonable length
+                if 5 <= len(issuer) <= 100 and not issuer.lower().startswith('invoice'):
+                    print(f"✓ Identified issuer from header: {issuer}")
+                    return issuer
+        
+        # Strategy 2: Look for explicit issuer indicators
+        issuer_patterns = [
+            r'(?:from|von|issuer|rechnungssteller|sender|absender)[:\s]+([A-Z][^\n]{3,50})',
+            r'(?:billed?\s+by|rechnung\s+von)[:\s]+([A-Z][^\n]{3,50})',
+            r'(?:invoice\s+from|rechnung\s+von)[:\s]+([A-Z][^\n]{3,50})',
+        ]
+        
+        for pattern in issuer_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                issuer = match.group(1).strip()
+                # Clean up and return
+                issuer = re.sub(r'\s+', ' ', issuer)
+                if 5 <= len(issuer) <= 100:  # Reasonable length
+                    print(f"✓ Identified issuer from pattern: {issuer}")
+                    return issuer
+        
+        # Strategy 2: Look in the first few lines (typical header location)
+        # Use spaCy NER if available
+        try:
+            from util import extract_company_name
+            # Check first 20% of document
+            header_text = '\n'.join(lines[:max(1, len(lines) // 5)])
+            company = extract_company_name(header_text)
+            if company:
+                print(f"✓ Identified issuer using NER: {company}")
+                return company
+        except Exception as e:
+            print(f"  Note: NER issuer identification unavailable: {e}")
+        
+        # Strategy 3: Check against known template issuers in context
+        for template_issuer in self.templates.keys():
+            # Check if issuer appears near top of document with context clues
+            top_section = '\n'.join(lines[:max(1, len(lines) // 5)])
+            if template_issuer.lower() in top_section.lower():
+                # Verify it's in issuer context, not recipient context
+                recipient_patterns = [
+                    r'(?:to|an|bill\s+to|rechnung\s+an|recipient|empfänger)[:\s]*.*?' + re.escape(template_issuer.lower()),
+                ]
+                
+                is_recipient = any(re.search(p, top_section.lower(), re.IGNORECASE) 
+                                  for p in recipient_patterns)
+                
+                if not is_recipient:
+                    print(f"✓ Identified issuer from known templates: {template_issuer}")
+                    return template_issuer
+        
+        print("  Could not confidently identify issuer")
+        return None
+    
+    def _match_template(self, text: str, identified_issuer: Optional[str] = None) -> Optional[Dict]:
+        """
+        Match text against template keywords to find the right template.
+        Uses a scoring system that prioritizes:
+        1. Direct issuer match (if issuer was identified)
+        2. Keywords appearing near the top of the document (likely issuer info)
+        3. Multiple keyword matches
+        4. Keywords NOT appearing in recipient context
+        
+        Args:
+            text: Invoice text
+            identified_issuer: Previously identified issuer name (if any)
+            
+        Returns:
             Matched template or None
         """
         text_lower = text.lower()
+        lines = text_lower.split('\n')
+        top_section = '\n'.join(lines[:max(1, len(lines) // 5)])
         
-        # Try to match each template
+        # If issuer was identified, try exact match first
+        if identified_issuer:
+            issuer_lower = identified_issuer.lower()
+            for template_issuer, template in self.templates.items():
+                if template_issuer in issuer_lower or issuer_lower in template_issuer:
+                    print(f"✓ Direct template match for identified issuer: {template['issuer']}")
+                    return template
+        
+        best_match = None
+        best_score = 0
+        
+        # Try to match each template with scoring
         for issuer, template in self.templates.items():
             keywords = template.get('keywords', [])
+            if not keywords:
+                continue
             
-            # Count matching keywords
-            matches = sum(1 for keyword in keywords if keyword.lower() in text_lower)
+            score = 0
+            matched_keywords = []
             
-            # If at least one keyword matches, use this template
-            if matches > 0:
-                print(f"  Matched {matches}/{len(keywords)} keywords for '{template['issuer']}'")
-                return template
+            # Check each keyword
+            for keyword in keywords:
+                keyword_lower = keyword.lower()
+                
+                if keyword_lower not in text_lower:
+                    continue
+                
+                matched_keywords.append(keyword)
+                
+                # Base score for match
+                score += 1
+                
+                # Check if keyword appears in recipient context (PENALTY)
+                recipient_patterns = [
+                    r'(?:to|an|bill\s+to|rechnung\s+an|recipient|empfänger|customer|kunde)[:\s]*.*?' + re.escape(keyword_lower),
+                ]
+                
+                is_in_recipient_context = any(
+                    re.search(p, text_lower, re.IGNORECASE | re.DOTALL) 
+                    for p in recipient_patterns
+                )
+                
+                if is_in_recipient_context:
+                    # Heavy penalty - this is likely the wrong template
+                    score -= 5
+                    print(f"  ! Keyword '{keyword}' found in recipient context - penalizing")
+                    continue
+                
+                # Bonus: keyword appears in first 20% of document (likely issuer section)
+                if keyword_lower in top_section:
+                    score += 3
+                
+                # Bonus: keyword appears near common issuer indicators
+                issuer_context_patterns = [
+                    r'(?:from|von|issuer|rechnungssteller|sender|absender)[:\s]*.*?' + re.escape(keyword_lower),
+                    re.escape(keyword_lower) + r'.*?(?:invoice|rechnung|bill)',
+                ]
+                
+                for pattern in issuer_context_patterns:
+                    if re.search(pattern, text_lower, re.IGNORECASE | re.DOTALL):
+                        score += 4
+                        break
+            
+            # Only consider if we have positive score and at least one keyword
+            if score > 0 and len(matched_keywords) > 0:
+                # Normalize score by keyword coverage
+                normalized_score = score * (len(matched_keywords) / len(keywords))
+                
+                print(f"  Template '{template['issuer']}': {len(matched_keywords)}/{len(keywords)} keywords, score={normalized_score:.2f}")
+                
+                if normalized_score > best_score:
+                    best_score = normalized_score
+                    best_match = template
         
-        print("No template keywords matched")
-        print("Create new template for the invoice type")
-        extractor = TemplateGenerator()
-        extractor.generate_template(invoice_text=text_lower, company_name="New Company")
-        # Another recursive step for matching with the new template
-        return self._match_template(text=text_lower)
+        # Only use template if score is significant (avoid weak matches)
+        if best_match and best_score >= 2.0:
+            print(f"✓ Selected template: {best_match['issuer']} (score: {best_score:.2f})")
+            return best_match
+        
+        print("No confident template match found (threshold: 2.0)")
+        return None
     
     def _extract_with_template(self, text: str, template: Dict) -> Dict:
         """
@@ -394,9 +561,9 @@ if __name__ == '__main__':
         processed_pages = preprocess(test_path)
         text = ocr_document(processed_pages)
         
-        # Extract data
+        # Extract data (with auto_generate option)
         print(text)
-        result = extractor.extract_invoice_data(text)
+        result = extractor.extract_invoice_data(text, auto_generate=True)  # Enable auto-generation
         
         # Display results
         print("\n" + "="*50)
